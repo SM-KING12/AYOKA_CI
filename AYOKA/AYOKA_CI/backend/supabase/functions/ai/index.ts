@@ -13,8 +13,8 @@ import {
 } from '../_shared/index.ts';
 
 // Gemini API configuration
-const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') || 'AIzaSyDMD5jpfuYtbLBnP_tz6HZLO_UUXhg1JnI';
-const GEMINI_MODEL = 'gemini-1.5-pro';
+const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') ?? '';
+if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY manquante dans les variables d\'environnement');const GEMINI_MODEL = 'gemini-1.5-pro';
 
 // System prompt for AYOKA AI
 const AYOKA_SYSTEM_PROMPT = `

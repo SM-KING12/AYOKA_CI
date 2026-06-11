@@ -1,3 +1,12 @@
+/**
+ * AssistantPage.tsx — AYOKA CI
+ * VERSION 2 — Améliorée :
+ *   - Suivi de contexte via ConversationContext (persisté dans la session)
+ *   - Affichage de la conversion monétaire dans les messages
+ *   - Recommandations "Bon Plan" enrichies avec cartes dédiées
+ *   - Correction du bug : generateAIResponse utilisait l'ancienne API sans contexte
+ */
+
 import { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -9,96 +18,108 @@ import {
   Trash2,
   Plus,
   Calendar,
+  TrendingUp,
 } from 'lucide-react';
 import { destinations, quickSuggestions, type ChatMessage, type RecommendationCard } from '../data';
-import { getAiRecommendations, generateItinerary } from '../mock/mockAiService';
+import {
+  getContextualAiResponse,
+  generateItinerary,
+  updateContext,
+  createEmptyContext,
+  extractBudget,
+  getBonPlans,
+  type ConversationContext,
+} from '../mock/mockAiService';
 import { useItineraries } from '../contexts/ItinerariesContext';
 
 const aiWelcomeMessage: ChatMessage = {
   id: '0',
   role: 'ai',
   content:
-    "Bonjour ! Je suis l'assistant AYOKA, votre guide IA pour d\u00e9couvrir la C\u00f4te d'Ivoire. Je peux vous aider \u00e0 planifier votre voyage, trouver des destinations, cr\u00e9er des itin\u00e9raires personnalis\u00e9s et bien plus encore. Que souhaitez-vous explorer ?",
+    "Bonjour ! Je suis l'assistant AYOKA, votre guide IA pour découvrir la Côte d'Ivoire. 🌍\n\nJe peux vous aider à :\n• Planifier votre voyage et créer des itinéraires\n• Trouver les meilleures destinations selon vos goûts\n• **Adapter mes recommandations à votre budget** (FCFA, $ ou €)\n\nQue souhaitez-vous explorer ?",
   timestamp: new Date().toISOString(),
 };
 
-function generateAIResponse(input: string): { content: string; cards?: RecommendationCard[] } {
+// ─── Génère la réponse IA + cartes de recommandation ───────────────────────
+function generateAIResponse(
+  input: string,
+  ctx: ConversationContext
+): { content: string; cards?: RecommendationCard[]; bonPlanCards?: RecommendationCard[] } {
   const lower = input.toLowerCase();
 
+  // Réponse textuelle contextuelle
+  const content = getContextualAiResponse(input, ctx);
+
+  // Cartes de destination selon le thème
+  let cards: RecommendationCard[] | undefined;
   if (lower.includes('plage') || lower.includes('bord de mer') || lower.includes('mer')) {
     const beaches = destinations.filter((d) => d.type === 'plage').slice(0, 3);
-    return {
-      content: getAiRecommendations(input),
-      cards: beaches.map((d) => ({
-        id: d.id,
-        title: d.name,
-        subtitle: d.city,
-        image: d.image,
-        price: d.price,
-        priceUnit: d.priceUnit,
-      })),
-    };
-  }
-
-  if (lower.includes('nature') || lower.includes('parc') || lower.includes('for\u00eat')) {
+    cards = beaches.map((d) => ({
+      id: d.id, title: d.name, subtitle: d.city, image: d.image, price: d.price, priceUnit: d.priceUnit,
+    }));
+  } else if (lower.includes('nature') || lower.includes('parc') || lower.includes('forêt') || lower.includes('foret')) {
     const nature = destinations.filter((d) => d.type === 'nature').slice(0, 3);
-    return {
-      content: getAiRecommendations(input),
-      cards: nature.map((d) => ({
-        id: d.id,
-        title: d.name,
-        subtitle: d.city,
-        image: d.image,
-        price: d.price,
-        priceUnit: d.priceUnit,
-      })),
-    };
+    cards = nature.map((d) => ({
+      id: d.id, title: d.name, subtitle: d.city, image: d.image, price: d.price, priceUnit: d.priceUnit,
+    }));
+  } else if (lower.includes('culture') || lower.includes('musée') || lower.includes('musee')) {
+    const culture = destinations.filter((d) => d.type === 'culture').slice(0, 3);
+    cards = culture.map((d) => ({
+      id: d.id, title: d.name, subtitle: d.city, image: d.image, price: d.price, priceUnit: d.priceUnit,
+    }));
   }
 
-  if (lower.includes('abidjan') || lower.includes('restaurant') || lower.includes('manger') || lower.includes('cuisine')) {
-    return { content: getAiRecommendations(input) };
+  // Cartes "Bon Plan" si un budget est détecté
+  let bonPlanCards: RecommendationCard[] | undefined;
+  const budgetInMsg = extractBudget(input);
+  const effectiveBudget = budgetInMsg?.xof ?? ctx.detectedBudgetXOF;
+  if (effectiveBudget) {
+    const bonPlans = getBonPlans(effectiveBudget, ctx.primaryInterest);
+    if (bonPlans.length > 0) {
+      bonPlanCards = bonPlans.map((bp) => {
+        // Trouve la destination correspondante pour avoir une image
+        const dest = destinations.find((d) => d.id === bp.id);
+        return {
+          id: bp.id,
+          title: bp.name,
+          subtitle: `${bp.tag} · ${bp.location}`,
+          image: dest?.image ?? 'https://images.pexels.com/photos/1591375/pexels-photo-1591375.jpeg?auto=compress&cs=tinysrgb&w=400',
+          price: bp.price,
+          priceUnit: bp.priceUnit,
+        };
+      });
+    }
   }
 
-  if (lower.includes('h\u00f4tel') || lower.includes('logement') || lower.includes('dormir') || lower.includes('h\u00e9bergement')) {
-    return { content: getAiRecommendations(input) };
+  // Cartes par défaut si aucun thème détecté
+  if (!cards && !bonPlanCards) {
+    const defaultDests = destinations.slice(0, 3);
+    cards = defaultDests.map((d) => ({
+      id: d.id, title: d.name, subtitle: d.city, image: d.image, price: d.price, priceUnit: d.priceUnit,
+    }));
   }
 
-  if (lower.includes('culture') || lower.includes('mus\u00e9e') || lower.includes('tradition')) {
-    return { content: getAiRecommendations(input) };
-  }
+  return { content, cards, bonPlanCards };
+}
 
-  if (lower.includes('itin\u00e9raire') || lower.includes('plan') || lower.includes('3 jours') || lower.includes('voyage') || lower.includes('g\u00e9n\u00e9rer')) {
-    return {
-      content:
-        "Je peux cr\u00e9er un itin\u00e9raire personnalis\u00e9 pour vous ! Utilisez le bouton **G\u00e9n\u00e9rer un itin\u00e9raire** ci-dessous, ou dites-moi votre destination et la dur\u00e9e souhait\u00e9e.\n\nEn attendant, voici un aper\u00e7u :\n\n**Jour 1 - Abidjan**\n\u2022 March\u00e9 de Cocody & Plateau\n\u2022 Croisi\u00e8re Lagune \u00c9bri\u00e9\n\u2022 D\u00eener au Zone 4\n\n**Jour 2 - Grand-Bassam**\n\u2022 Quartier colonial UNESCO\n\u2022 Plage & Mus\u00e9e du Costume\n\n**Jour 3 - Assinie**\n\u2022 Sports nautiques\n\u2022 Fruits de mer au bord de l'eau",
-    };
-  }
-
-  const defaultDestinations = destinations.slice(0, 3);
-  return {
-    content: getAiRecommendations(input),
-    cards: defaultDestinations.map((d) => ({
-      id: d.id,
-      title: d.name,
-      subtitle: d.city,
-      image: d.image,
-      price: d.price,
-      priceUnit: d.priceUnit,
-    })),
-  };
+// ─── Types ────────────────────────────────────────────────────────────────
+interface EnhancedChatMessage extends ChatMessage {
+  bonPlanCards?: RecommendationCard[];
 }
 
 interface ChatSession {
   id: string;
   title: string;
-  messages: ChatMessage[];
+  messages: EnhancedChatMessage[];
+  context: ConversationContext;  // ← NOUVEAU : contexte persisté par session
   createdAt: string;
 }
 
+// ─── Composant principal ──────────────────────────────────────────────────
 export default function AssistantPage() {
   const [sessions, setSessions] = useState<ChatSession[]>(() => {
     try {
-      const stored = localStorage.getItem('ayoka_chat_sessions');
+      const stored = localStorage.getItem('ayoka_chat_sessions_v2');
       return stored ? JSON.parse(stored) : [];
     } catch { return []; }
   });
@@ -110,10 +131,11 @@ export default function AssistantPage() {
   const { addItinerary } = useItineraries();
 
   const activeSession = sessions.find((s) => s.id === activeSessionId);
-  const messages = activeSession?.messages || [aiWelcomeMessage];
+  const messages: EnhancedChatMessage[] = activeSession?.messages || [aiWelcomeMessage];
+  const currentContext: ConversationContext = activeSession?.context || createEmptyContext();
 
   useEffect(() => {
-    localStorage.setItem('ayoka_chat_sessions', JSON.stringify(sessions));
+    localStorage.setItem('ayoka_chat_sessions_v2', JSON.stringify(sessions));
   }, [sessions]);
 
   useEffect(() => {
@@ -127,6 +149,7 @@ export default function AssistantPage() {
       id: Date.now().toString(),
       title: 'Nouvelle conversation',
       messages: [aiWelcomeMessage],
+      context: createEmptyContext(),
       createdAt: new Date().toISOString(),
     };
     setSessions((prev) => [newSession, ...prev]);
@@ -138,11 +161,14 @@ export default function AssistantPage() {
     if (!text.trim()) return;
 
     let currentSessionId = activeSessionId;
+    let sessionContext = currentContext;
+
     if (!currentSessionId) {
       const newSession: ChatSession = {
         id: Date.now().toString(),
         title: text.slice(0, 30),
         messages: [aiWelcomeMessage],
+        context: createEmptyContext(),
         createdAt: new Date().toISOString(),
       };
       currentSessionId = newSession.id;
@@ -150,7 +176,10 @@ export default function AssistantPage() {
       setActiveSessionId(currentSessionId);
     }
 
-    const userMsg: ChatMessage = {
+    // Mise à jour du contexte avec les infos du message utilisateur
+    const updatedContext = updateContext(sessionContext, text);
+
+    const userMsg: EnhancedChatMessage = {
       id: Date.now().toString(),
       role: 'user',
       content: text.trim(),
@@ -164,6 +193,7 @@ export default function AssistantPage() {
               ...s,
               title: s.messages.length <= 1 ? text.slice(0, 30) : s.title,
               messages: [...s.messages, userMsg],
+              context: updatedContext,  // ← contexte mis à jour
             }
           : s
       )
@@ -173,12 +203,13 @@ export default function AssistantPage() {
 
     const sessionId = currentSessionId;
     setTimeout(() => {
-      const { content, cards } = generateAIResponse(text);
-      const aiMsg: ChatMessage = {
+      const { content, cards, bonPlanCards } = generateAIResponse(text, updatedContext);
+      const aiMsg: EnhancedChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'ai',
         content,
         cards,
+        bonPlanCards,
         timestamp: new Date().toISOString(),
       };
       setSessions((prev) =>
@@ -187,16 +218,22 @@ export default function AssistantPage() {
         )
       );
       setIsTyping(false);
-    }, 1500);
+    }, 1200);
   };
 
   const handleGenerateItinerary = () => {
-    const it = generateItinerary('Abidjan', 3, 'standard');
+    const dest = currentContext.mentionedDestination ?? 'Abidjan';
+    const days = currentContext.mentionedDays ?? 3;
+    const budget = currentContext.detectedBudgetXOF
+      ? currentContext.detectedBudgetXOF >= 150000 ? 'premium'
+        : currentContext.detectedBudgetXOF >= 80000 ? 'standard' : 'economique'
+      : 'standard';
+    const it = generateItinerary(dest, days, budget);
     addItinerary(it);
-    const aiMsg: ChatMessage = {
+    const aiMsg: EnhancedChatMessage = {
       id: (Date.now() + 1).toString(),
       role: 'ai',
-      content: `J'ai g\u00e9n\u00e9r\u00e9 un itin\u00e9raire de 3 jours pour vous ! **${it.name}** avec un budget de ${it.totalBudget.toLocaleString()} FCFA. Vous pouvez le retrouver dans la section **Mes itin\u00e9raires**.`,
+      content: `✅ Itinéraire généré ! **${it.name}** — ${days} jour${days > 1 ? 's' : ''}, budget ${it.totalBudget.toLocaleString()} FCFA.\nRetrouvez-le dans **Mes itinéraires**. 📋`,
       timestamp: new Date().toISOString(),
     };
     if (activeSessionId) {
@@ -208,6 +245,7 @@ export default function AssistantPage() {
     }
   };
 
+  // ─── Rendu ──────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-navy-900">
       {/* Header */}
@@ -220,13 +258,19 @@ export default function AssistantPage() {
           <div className="flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse-soft" />
             <span className="text-green-400 text-xs font-body">En ligne</span>
+            {currentContext.detectedBudgetXOF && (
+              <span className="ml-2 px-2 py-0.5 rounded-full bg-ai-400/20 text-ai-400 text-[10px] font-heading font-semibold flex items-center gap-1">
+                <TrendingUp className="w-2.5 h-2.5" />
+                {currentContext.detectedBudgetXOF.toLocaleString()} FCFA
+              </span>
+            )}
           </div>
         </div>
         <button
           onClick={handleGenerateItinerary}
           className="hidden sm:flex items-center gap-1.5 px-3 py-2 rounded-xl bg-ai-400/10 text-ai-400 text-xs font-heading font-medium hover:bg-ai-400/20 transition-all"
         >
-          <Calendar className="w-3.5 h-3.5" /> G\u00e9n\u00e9rer itin\u00e9raire
+          <Calendar className="w-3.5 h-3.5" /> Générer itinéraire
         </button>
         <button
           onClick={() => setShowHistory(!showHistory)}
@@ -272,8 +316,11 @@ export default function AssistantPage() {
                       }`}
                     >
                       <div className="font-heading font-medium text-white text-xs truncate">{s.title}</div>
-                      <div className="text-white/30 text-[10px] font-body mt-0.5">
-                        {s.messages.length} message{s.messages.length !== 1 ? 's' : ''}
+                      <div className="text-white/30 text-[10px] font-body mt-0.5 flex items-center gap-2">
+                        <span>{s.messages.length} message{s.messages.length !== 1 ? 's' : ''}</span>
+                        {s.context.detectedBudgetXOF && (
+                          <span className="text-ai-400/60">💰 {(s.context.detectedBudgetXOF / 1000).toFixed(0)}K</span>
+                        )}
                       </div>
                     </button>
                   ))
@@ -313,10 +360,15 @@ export default function AssistantPage() {
                       >
                         {msg.content.split('\n').map((line, i) => (
                           <p key={i} className={line === '' ? 'h-2' : ''}>
-                            {line.startsWith('\u2022') ? (
+                            {line.startsWith('•') ? (
                               <span className="block ml-2">{line}</span>
-                            ) : line.startsWith('**') ? (
+                            ) : line.startsWith('**') && line.endsWith('**') ? (
                               <span className="font-heading font-semibold">{line.replace(/\*\*/g, '')}</span>
+                            ) : line.includes('**') ? (
+                              // Inline bold (ex: "Budget **50 000 FCFA**")
+                              <span dangerouslySetInnerHTML={{
+                                __html: line.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                              }} />
                             ) : (
                               line
                             )}
@@ -324,7 +376,7 @@ export default function AssistantPage() {
                         ))}
                       </div>
 
-                      {/* Recommendation Cards */}
+                      {/* Cartes de destination thématiques */}
                       {msg.cards && msg.cards.length > 0 && (
                         <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
                           {msg.cards.map((card) => (
@@ -333,11 +385,7 @@ export default function AssistantPage() {
                               to={`/destination/${card.id}`}
                               className="flex gap-3 p-3 rounded-xl glass hover:bg-white/10 transition-all duration-300 group"
                             >
-                              <img
-                                src={card.image}
-                                alt={card.title}
-                                className="w-14 h-14 rounded-lg object-cover"
-                              />
+                              <img src={card.image} alt={card.title} className="w-14 h-14 rounded-lg object-cover" />
                               <div className="flex-1 min-w-0">
                                 <div className="font-heading font-semibold text-white text-xs group-hover:text-ai-400 transition-colors truncate">
                                   {card.title}
@@ -359,6 +407,43 @@ export default function AssistantPage() {
                         </div>
                       )}
 
+                      {/* Cartes "Bon Plan" budget */}
+                      {msg.bonPlanCards && msg.bonPlanCards.length > 0 && (
+                        <div className="mt-3">
+                          <div className="flex items-center gap-1.5 mb-2">
+                            <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-emerald-400 text-[10px] font-heading font-semibold uppercase tracking-wider">
+                              Bons Plans dans votre budget
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {msg.bonPlanCards.map((card) => (
+                              <Link
+                                key={card.id}
+                                to={`/destination/${card.id}`}
+                                className="flex gap-3 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 hover:bg-emerald-500/20 transition-all duration-300 group"
+                              >
+                                <img src={card.image} alt={card.title} className="w-14 h-14 rounded-lg object-cover" />
+                                <div className="flex-1 min-w-0">
+                                  <div className="font-heading font-semibold text-white text-xs group-hover:text-emerald-400 transition-colors truncate">
+                                    {card.title}
+                                  </div>
+                                  <div className="text-white/40 text-[10px] font-body mt-0.5 truncate">{card.subtitle}</div>
+                                  {card.price !== undefined && card.price > 0 && (
+                                    <div className="mt-1">
+                                      <span className="font-heading font-bold text-emerald-400 text-xs">
+                                        {card.price.toLocaleString()}
+                                      </span>
+                                      <span className="text-white/40 text-[10px] ml-1">{card.priceUnit ?? 'FCFA'}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </Link>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                       {/* Action buttons for AI messages */}
                       {msg.role === 'ai' && (
                         <div className="flex items-center gap-2 mt-2">
@@ -366,7 +451,7 @@ export default function AssistantPage() {
                             onClick={handleGenerateItinerary}
                             className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-ai-400/10 text-ai-400 text-[10px] font-heading font-medium hover:bg-ai-400/20 transition-all"
                           >
-                            <Calendar className="w-3 h-3" /> Itin\u00e9raire
+                            <Calendar className="w-3 h-3" /> Itinéraire
                           </button>
                           <Link
                             to="/explorer"
@@ -405,7 +490,7 @@ export default function AssistantPage() {
           {messages.length <= 1 && (
             <div className="px-4 pb-2">
               <div className="flex flex-wrap gap-2">
-                {quickSuggestions.map((s) => (
+                {[...quickSuggestions, 'Budget 100$', 'Budget 50€'].map((s) => (
                   <button
                     key={s}
                     onClick={() => sendMessage(s)}
@@ -426,7 +511,7 @@ export default function AssistantPage() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && sendMessage(input)}
-                placeholder="Demandez-moi tout sur la C\u00f4te d'Ivoire..."
+                placeholder="Demandez-moi tout… ou dites votre budget en $, € ou FCFA"
                 className="flex-1 bg-transparent text-white placeholder-white/30 font-body px-4 py-3 focus:outline-none text-sm"
               />
               <button

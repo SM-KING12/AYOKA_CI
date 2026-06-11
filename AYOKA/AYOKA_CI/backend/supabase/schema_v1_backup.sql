@@ -1,18 +1,4 @@
 -- ============================================================
--- AYOKA CI - SCHEMA PATCHÉ (v2)
--- ============================================================
--- Patches appliqués :
---   #1 : Colonne `type` + champs `city`, `price`, `price_unit` sur destinations
---   #2 : ENUM notification_type — ajout de 'booking' (alignement mocks frontend)
---   #3 : Table `conversations` + FK sur messages.conversation_id + RLS
---   #4 : Index sur conversations
---   #5 : RLS policies pour conversations
---   #6 : Trigger update_partner_stats corrigé (INSERT→UPDATE, transition status)
---   #7 : Table `config` avec taux de change centralisés (résout incohérence backend/frontend)
--- IMPORTANT : Retirer la clé Gemini hardcodée dans functions/ai/index.ts ligne 14
--- ============================================================
-
--- ============================================================
 -- AYOKA CI - SUPABASE DATABASE SCHEMA
 -- ============================================================
 -- Plateforme touristique hybride (Web + Mobile)
@@ -39,9 +25,7 @@ CREATE TYPE booking_status AS ENUM ('pending', 'confirmed', 'completed', 'cancel
 CREATE TYPE payment_status AS ENUM ('pending', 'paid', 'refunded', 'failed');
 
 -- Notification types
--- [PATCH #2] Ajout de 'booking' pour correspondre aux mocks frontend (mockAdminData.ts)
--- L'ancien 'reservation' est conservé pour compatibilité backend
-CREATE TYPE notification_type AS ENUM ('booking', 'reservation', 'reminder', 'ai', 'promotion', 'system');
+CREATE TYPE notification_type AS ENUM ('reservation', 'reminder', 'ai', 'promotion', 'system');
 
 -- ============================================================
 -- TABLES
@@ -95,29 +79,19 @@ CREATE TABLE public.partners (
 );
 
 -- DESTINATIONS
--- [PATCH #1] Ajout de la colonne `type` pour aligner avec les types TypeScript frontend
--- (Destination['type'] = 'plage' | 'hotel' | 'restaurant' | 'culture' | 'nature' | 'aventure')
-CREATE TYPE destination_type AS ENUM ('plage', 'hotel', 'restaurant', 'culture', 'nature', 'aventure');
-
 CREATE TABLE public.destinations (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name TEXT NOT NULL,
   slug TEXT UNIQUE NOT NULL,
   description TEXT,
-  short_description TEXT,
-  type destination_type NOT NULL DEFAULT 'culture',
   region TEXT,
-  country TEXT DEFAULT 'Côte d''Ivoire',
-  city TEXT,
+  country TEXT DEFAULT 'Côte d\'Ivoire',
   image_url TEXT,
-  price DECIMAL(15,2) DEFAULT 0,
-  price_unit TEXT DEFAULT 'FCFA',
   coordinates JSONB,
   highlights TEXT[],
   best_season TEXT,
   budget_level TEXT,
-  rating DECIMAL(3,2) DEFAULT 0.0 CHECK (rating >= 0 AND rating <= 5),
-  reviews_count INTEGER DEFAULT 0,
+  rating DECIMAL(3,2) DEFAULT 0.0,
   is_featured BOOLEAN DEFAULT FALSE,
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -247,22 +221,10 @@ CREATE TABLE public.reviews (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- CONVERSATIONS (Partner/User direct messaging)
--- [PATCH #3] Table manquante — messages.conversation_id n'avait pas de FK
-CREATE TABLE public.conversations (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  participant_a UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  participant_b UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  last_message_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(participant_a, participant_b)
-);
-
 -- MESSAGES (Partner communication)
 CREATE TABLE public.messages (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  -- [PATCH #3] FK ajoutée vers conversations (était un UUID orphelin avant)
-  conversation_id UUID NOT NULL REFERENCES public.conversations(id) ON DELETE CASCADE,
+  conversation_id UUID NOT NULL,
   sender_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   receiver_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   content TEXT NOT NULL,
@@ -385,11 +347,6 @@ CREATE INDEX idx_messages_sender_id ON public.messages(sender_id);
 CREATE INDEX idx_messages_receiver_id ON public.messages(receiver_id);
 CREATE INDEX idx_messages_created_at ON public.messages(created_at);
 
--- Conversations (PATCH #3)
-CREATE INDEX idx_conversations_participant_a ON public.conversations(participant_a);
-CREATE INDEX idx_conversations_participant_b ON public.conversations(participant_b);
-CREATE INDEX idx_conversations_last_message ON public.conversations(last_message_at);
-
 -- Notifications
 CREATE INDEX idx_notifications_user_id ON public.notifications(user_id);
 CREATE INDEX idx_notifications_type ON public.notifications(type);
@@ -428,9 +385,6 @@ ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.admin_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.ai_conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.ai_messages ENABLE ROW LEVEL SECURITY;
-
--- [PATCH #3] RLS pour conversations
-ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
 
 -- USERS RLS
 CREATE POLICY "Users can view own profile" ON public.users
@@ -588,16 +542,6 @@ CREATE POLICY "Users can create messages" ON public.messages
 CREATE POLICY "Users can update own messages" ON public.messages
   FOR UPDATE USING (sender_id = auth.uid());
 
--- CONVERSATIONS RLS (PATCH #3)
-CREATE POLICY "Users can view own conversations" ON public.conversations
-  FOR SELECT USING (participant_a = auth.uid() OR participant_b = auth.uid());
-
-CREATE POLICY "Users can create conversations" ON public.conversations
-  FOR INSERT WITH CHECK (participant_a = auth.uid() OR participant_b = auth.uid());
-
-CREATE POLICY "Users can update own conversations" ON public.conversations
-  FOR UPDATE USING (participant_a = auth.uid() OR participant_b = auth.uid());
-
 -- NOTIFICATIONS RLS
 CREATE POLICY "Users can view own notifications" ON public.notifications
   FOR SELECT USING (user_id = auth.uid());
@@ -706,41 +650,21 @@ CREATE TRIGGER update_service_booking_count_trigger
   FOR EACH ROW EXECUTE FUNCTION update_service_booking_count();
 
 -- Update partner stats
--- [PATCH #6] CORRECTION CRITIQUE : le trigger précédent écoutait INSERT avec status='completed'
--- ce qui est impossible (toute réservation commence 'pending').
--- Désormais on écoute uniquement les UPDATE et on détecte la transition → 'completed'.
 CREATE OR REPLACE FUNCTION update_partner_stats()
 RETURNS TRIGGER AS $$
 BEGIN
-  -- Incrémenter uniquement lors de la transition vers 'completed'
-  IF TG_OP = 'UPDATE'
-     AND OLD.status IS DISTINCT FROM NEW.status
-     AND NEW.status = 'completed' THEN
-    UPDATE public.partners
-    SET
-      completed_bookings = completed_bookings + 1,
-      revenue = revenue + NEW.total_price
-    WHERE id = NEW.partner_id;
+  IF TG_OP = 'INSERT' THEN
+    UPDATE public.partners 
+    SET completed_bookings = completed_bookings + 1,
+        revenue = revenue + NEW.total_price
+    WHERE id = NEW.partner_id AND NEW.status = 'completed';
   END IF;
-
-  -- Décrémenter si une réservation 'completed' est annulée (remboursement)
-  IF TG_OP = 'UPDATE'
-     AND OLD.status = 'completed'
-     AND NEW.status = 'cancelled' THEN
-    UPDATE public.partners
-    SET
-      completed_bookings = GREATEST(completed_bookings - 1, 0),
-      revenue = GREATEST(revenue - OLD.total_price, 0)
-    WHERE id = NEW.partner_id;
-  END IF;
-
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- [PATCH #6] Trigger sur UPDATE uniquement (était AFTER INSERT OR UPDATE — l'INSERT était inutile)
 CREATE TRIGGER update_partner_stats_trigger
-  AFTER UPDATE ON public.bookings
+  AFTER INSERT OR UPDATE ON public.bookings
   FOR EACH ROW EXECUTE FUNCTION update_partner_stats();
 
 -- ============================================================
@@ -769,44 +693,11 @@ $$ LANGUAGE SQL SECURITY DEFINER;
 -- INITIAL DATA
 -- ============================================================
 
--- [PATCH #7] Table de configuration centralisée pour les taux de change
--- Source unique de vérité entre backend (Edge Functions) et frontend (mockAiService.ts)
--- Remplace les constantes dupliquées et incohérentes entre les deux couches
-CREATE TABLE public.config (
-  key TEXT PRIMARY KEY,
-  value JSONB NOT NULL,
-  description TEXT,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- RLS : lecture publique, écriture admin uniquement
-ALTER TABLE public.config ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Public can read config" ON public.config FOR SELECT USING (TRUE);
-CREATE POLICY "Admins can manage config" ON public.config
-  FOR ALL USING (
-    EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role = 'admin')
-  );
-
--- Taux de change alignés (résout l'incohérence USD 605 vs 600, GBP 830 vs 760)
-INSERT INTO public.config (key, value, description) VALUES
-('exchange_rates', '{
-  "USD": 610,
-  "EUR": 655,
-  "GBP": 800,
-  "CAD": 450,
-  "XOF": 1
-}', 'Taux de conversion vers XOF (Franc CFA). À mettre à jour périodiquement.');
-
 -- Insert sample destinations
--- [PATCH #1] Champs `type`, `city`, `price`, `price_unit` ajoutés pour aligner avec le frontend
-INSERT INTO public.destinations (name, slug, description, short_description, type, region, city, price, price_unit, highlights, best_season, budget_level, is_featured) VALUES
-('Assinie-Mafia',   'assinie',       'Station balnéaire prisée à l''est d''Abidjan avec plages dorées et lagunes.',               'Station balnéaire chic avec plages dorées et sports nautiques',     'plage',    'Sud-Est',          'Assinie',        35000, 'FCFA/nuit',      ARRAY['Plages dorées','Surf','Resorts luxury','Ambiance festive'],                                          'Novembre à mars',   'moderate', TRUE),
-('Grand-Bassam',    'grand-bassam',  'Ancienne capitale coloniale classée UNESCO avec architecture préservée et plages.',           'Ville historique UNESCO avec architecture coloniale et plages',      'culture',  'Sud-Comoe',        'Grand-Bassam',   15000, 'FCFA/nuit',      ARRAY['Patrimoine UNESCO','Architecture coloniale','Plages tranquilles','Art et culture'],                   'Toute l''année',    'low',      TRUE),
-('Yamoussoukro',    'yamoussoukro',  'Capitale politique avec la Basilique Notre-Dame de la Paix, inspirée de Saint-Pierre.',      'Monument religieux monumental inspiré de Saint-Pierre de Rome',     'culture',  'Lacs',             'Yamoussoukro',    5000, 'FCFA/visite',    ARRAY['Architecture grandiose','Vitraux spectaculaires','Histoire unique','Capitale politique'],             'Toute l''année',    'moderate', FALSE),
-('Mont Tonkoui',    'mont-tonkoui',  'Deuxième plus haut sommet de Côte d''Ivoire (1 159m), randonnée épique et vue panoramique.', 'Randonnée spectaculaire avec vue panoramique au-dessus des nuages', 'aventure', 'Montagnes',        'Man',            20000, 'FCFA/randonnée', ARRAY['Randonnée épique','Vue panoramique','Ponts de lianes','Culture Dan'],                                'Novembre à février','low',      FALSE),
-('Parc National de Taï','parc-tai',  'Forêt tropicale primaire UNESCO abritant chimpanzés et hippopotames pygmées.',               'Forêt tropicale primaire UNESCO avec biodiversité exceptionnelle',  'nature',   'Bas-Sassandra',    'Taï',            25000, 'FCFA/visite',    ARRAY['Forêt primaire','Chimpanzés','Hippopotames pygmées','Randonnée'],                                     'Novembre à mars',   'low',      TRUE),
-('Lagune Ébrié',    'lagune-ebrie',  'Croisières urbaines traversant Abidjan avec vues sur le Plateau et villages de pêcheurs.',   'Croisières urbaines au cœur de la capitale économique',             'nature',   'Sud',              'Abidjan',        10000, 'FCFA/croisière', ARRAY['Croisières','Coucher du soleil','Contraste urbain','Pêche traditionnelle'],                          'Toute l''année',    'moderate', FALSE),
-('Hôtel Sofitel Abidjan','sofitel-abidjan','Palace 5 étoiles avec piscine panoramique vue lagune et spa de renommée internationale.','Palace 5 étoiles avec vue lagune au cœur du Plateau',             'hotel',    'Sud',              'Abidjan',        85000, 'FCFA/nuit',      ARRAY['Piscine panoramique','Spa premium','Gastronomie','Vue lagune'],                                       'Toute l''année',    'high',     FALSE),
-('Marché d''Abidjan','marche-abidjan','Les marchés de Cocody et Adjamé : tissus wax, épices, fruits tropicaux, artisanat local.',  'Expérience sensorielle au cœur des marchés colorés d''Abidjan',    'culture',  'Sud',              'Abidjan',            0, 'Gratuit',        ARRAY['Tissus wax','Épices','Fruits tropicaux','Ambiance locale'],                                          'Toute l''année',    'low',      FALSE),
-('Bouaké',          'bouake',        'Deuxième ville de Côte d''Ivoire, centre culturel et commercial animé.',                     'Centre culturel et artisanal de Côte d''Ivoire',                    'culture',  'Vallée du Bandama','Bouaké',             0, 'Gratuit',        ARRAY['Marché central','Tissage','Artisanat','Culture locale'],                                             'Toute l''année',    'low',      FALSE),
-('San-Pédro',       'san-pedro',     'Port de pêche et de tourisme au cœur du Bas-Sassandra.',                                    'Port et nature sauvage au Bas-Sassandra',                           'nature',   'Bas-Sassandra',    'San-Pédro',          0, 'Gratuit',        ARRAY['Plages','Pêche artisanale','Nature sauvage','Parc national Taï'],                                    'Toute l''année',    'moderate', FALSE);
+INSERT INTO public.destinations (name, slug, description, region, country, highlights, best_season, budget_level, is_featured) VALUES
+('Assinie', 'assinie', 'Station balnéaire populaire avec ses lagunes et plages', 'Sud-Est', 'Côte d''Ivoire', ARRAY['Lagune d''Assinie', 'Plages de Monogaga', 'Fruits de mer', 'Pêche'], 'Novembre à mars', 'moderate', TRUE),
+('Grand-Bassam', 'grand-bassam', 'Ancienne capitale coloniale classée UNESCO', 'Sud-Comoe', 'Côte d''Ivoire', ARRAY['Quartier colonial', 'Cathédrale', 'Musée national', 'Architecture historique'], 'Toute l''année', 'low', TRUE),
+('Yamoussoukro', 'yamoussoukro', 'Capitale politique avec la basilique Notre-Dame de la Paix', 'Lacs', 'Côte d''Ivoire', ARRAY['Basilique Notre-Dame de la Paix', 'Lac aux crocodiles', 'Palais présidentiel'], 'Toute l''année', 'moderate', FALSE),
+('Man', 'man', 'Ville de la montagne avec cascades et randonnées', 'Montagnes', 'Côte d''Ivoire', ARRAY['Cascades', 'Mont Tonkoui', 'Randonnée', 'Nature'], 'Novembre à février', 'low', TRUE),
+('Bouaké', 'bouake', 'Deuxième ville de Côte d''Ivoire, centre culturel', 'Vallée du Bandama', 'Côte d''Ivoire', ARRAY['Marché central', 'Tissage', 'Artisanat', 'Culture locale'], 'Toute l''année', 'low', FALSE),
+('San-Pédro', 'san-pedro', 'Port de pêche et tourisme', 'Bas-Sassandra', 'Côte d''Ivoire', ARRAY['Plages', 'Pêche artisanale', 'Forêt du Banco', 'Parc national Taï'], 'Toute l''année', 'moderate', FALSE);
